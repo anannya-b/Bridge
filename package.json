@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "description": "Bridge — Universal Translation & Trust Layer for Agent-to-Agent Commerce (Razorpay AI Buildathon)",
   "private": true,
+  "type": "module",
   "scripts": {
     "start:backend": "npm --prefix backend start",
     "start:frontend": "npm --prefix frontend dev",
     "dev:backend": "npm --prefix backend run dev",
     "test": "npm --prefix backend test",
+    "test:concurrency": "node concurrency_test.js",
     "build": "npm --prefix frontend run build"
   }
 }
