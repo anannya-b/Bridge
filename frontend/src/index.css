@@ -518,6 +518,12 @@ html, body, #root {
   background-color: var(--chrome-dark);
 }
 
+.lane-item.pending-validation {
+  border-color: var(--chrome-dim);
+  color: var(--passive-breach);
+  background-color: var(--chrome-dark);
+}
+
 .lane-dot {
   width: 6px;
   height: 6px;
@@ -526,6 +532,7 @@ html, body, #root {
 .lane-dot.active { background-color: var(--approve); }
 .lane-dot.idle { background-color: var(--chrome-dim); }
 .lane-dot.ingesting { background-color: var(--chrome); animation: pulse-dot 1s infinite ease-in-out; }
+.lane-dot.pending-validation { background-color: var(--passive-breach); animation: pulse-dot 1.5s infinite ease-in-out; }
 
 .ingest-progress-bar {
   width: 120px;

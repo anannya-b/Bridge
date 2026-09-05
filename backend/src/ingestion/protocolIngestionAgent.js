@@ -1,9 +1,11 @@
 import { BaseProtocolAdapter } from '../adapters/baseAdapter.js';
 import { adapterRegistry } from '../adapters/adapterRegistry.js';
+import { validateAdapterMapping } from './adapterValidator.js';
 
 /**
  * Protocol Ingestion Agent
- * Reads an unseen protocol specification, infers schema & creates a runtime adapter
+ * Reads an unseen protocol specification, infers schema, creates runtime adapter,
+ * and runs deterministic validation before marking active.
  */
 export class ProtocolIngestionAgent {
   constructor() {
@@ -13,77 +15,130 @@ export class ProtocolIngestionAgent {
   /**
    * Live ingest a protocol specification
    * @param {string} specText - The raw Markdown/JSON/Text protocol specification
-   * @param {object} options - Options & callbacks for streaming progress
+   * @param {function} onProgress - Progress update callback
    */
   async ingestProtocol(specText, onProgress = () => {}) {
-    onProgress({ stage: 'ANALYZING_SPEC', progress: 15, message: 'Parsing protocol specification structure & handshake headers...' });
+    onProgress({ stage: 'ANALYZING_SPEC', progress: 15, message: 'Parsing protocol specification structure and handshake headers...' });
     await new Promise(r => setTimeout(r, 600));
 
-    // Analyze protocol metadata
+    // 1. Analyze protocol metadata
     const protocolMeta = this.extractProtocolMetadata(specText);
     
     onProgress({ 
       stage: 'INFERRING_SCHEMA', 
-      progress: 40, 
-      message: `Identified protocol "${protocolMeta.name}" (${protocolMeta.id} v${protocolMeta.version}). Mapping agent, itemized cart & pricing schemas...` 
+      progress: 35, 
+      message: `Identified protocol "${protocolMeta.name}" (${protocolMeta.id} v${protocolMeta.version}). Inferring field mappings...` 
     });
-    await new Promise(r => setTimeout(r, 800));
+    await new Promise(r => setTimeout(r, 700));
 
-    // Generate dynamic adapter code
+    // 2. Synthesize dynamic adapter code
     const generatedCode = this.synthesizeAdapterCode(protocolMeta, specText);
 
     onProgress({ 
       stage: 'COMPILING_ADAPTER', 
-      progress: 70, 
-      message: 'Compiling JavaScript AST & sandbox verifying signature hooks...' 
-    });
-    await new Promise(r => setTimeout(r, 700));
-
-    // Create live dynamic class instance
-    const dynamicAdapter = this.instantiateDynamicAdapter(protocolMeta, generatedCode);
-
-    onProgress({ 
-      stage: 'SELF_TESTING', 
-      progress: 90, 
-      message: 'Self-testing adapter against protocol sample transaction envelope...' 
+      progress: 60, 
+      message: 'Compiling JavaScript AST and instantiating sandbox adapter instance...' 
     });
     await new Promise(r => setTimeout(r, 600));
 
-    // Run test execution on sample payload
-    const samplePayload = protocolMeta.samplePayload || this.generateSamplePayload(protocolMeta);
-    const testNormalized = dynamicAdapter.normalize(samplePayload, { merchant_id: 'kirana_test_04' });
+    // 3. Create live dynamic class instance with initial PENDING_VALIDATION status
+    const dynamicAdapter = this.instantiateDynamicAdapter(protocolMeta, generatedCode);
+    dynamicAdapter.status = 'PENDING_VALIDATION';
 
-    if (!testNormalized.agent_id || testNormalized.total_amount === undefined) {
-      throw new Error(`Self-test failed: Incomplete normalization (${JSON.stringify(testNormalized)})`);
+    // 4. Test execution on sample payload
+    const samplePayload = protocolMeta.samplePayload || this.generateSamplePayload(protocolMeta);
+    let testNormalized;
+    try {
+      testNormalized = dynamicAdapter.normalize(samplePayload, { merchant_id: 'kirana_test_04' });
+    } catch (normErr) {
+      testNormalized = { error: normErr.message };
     }
 
-    // Register into the live registry
+    // 5. Construct proposal for deterministic validation
+    const proposal = {
+      protocolId: protocolMeta.id,
+      name: protocolMeta.name,
+      version: protocolMeta.version,
+      fieldMappings: {
+        agent_id: protocolMeta.agentField || 'headers.x_agent_id || body.payer_did',
+        items: protocolMeta.itemsField || 'body.purchase_orders || body.items',
+        total_amount: protocolMeta.amountField || 'body.settlement_amount || body.amount',
+        currency: protocolMeta.currencyField || 'body.currency || "INR"'
+      },
+      samplePayload,
+      sampleNormalized: testNormalized
+    };
+
+    // Register into registry with PENDING_VALIDATION status
     adapterRegistry.registerAdapter(dynamicAdapter);
+
+    onProgress({ 
+      stage: 'PENDING_VALIDATION', 
+      progress: 85, 
+      message: 'Running deterministic validateAdapterMapping(proposal) checks...' 
+    });
+    await new Promise(r => setTimeout(r, 700));
+
+    // 6. Deterministic Validation
+    const validationResult = validateAdapterMapping(proposal);
+
+    if (!validationResult.isValid) {
+      dynamicAdapter.status = 'PENDING_VALIDATION';
+      dynamicAdapter.validation = validationResult;
+
+      onProgress({ 
+        stage: 'PENDING_VALIDATION', 
+        progress: 85, 
+        message: `Validation incomplete: failed fields [${validationResult.failedFields.join(', ')}]. Adapter status held at PENDING_VALIDATION.` 
+      });
+
+      const failedResult = {
+        protocolId: protocolMeta.id,
+        name: protocolMeta.name,
+        version: protocolMeta.version,
+        status: 'PENDING_VALIDATION',
+        proposal,
+        validationResult,
+        generatedCode,
+        samplePayload,
+        testNormalized,
+        ingestedAt: new Date().toISOString()
+      };
+      this.history.push(failedResult);
+      return failedResult;
+    }
+
+    // 7. Validation fully passed -> mark active
+    dynamicAdapter.status = 'active';
+    dynamicAdapter.validation = validationResult;
 
     onProgress({ 
       stage: 'ACTIVE', 
       progress: 100, 
-      message: `Protocol "${protocolMeta.name}" successfully ingested & registered to runtime! Live routing enabled.` 
+      message: `Protocol "${protocolMeta.name}" passed all ${validationResult.passedFieldsCount} deterministic mapping checks. Adapter marked ACTIVE!` 
     });
 
-    const result = {
+    const successResult = {
       protocolId: protocolMeta.id,
       name: protocolMeta.name,
       version: protocolMeta.version,
+      status: 'ACTIVE',
+      proposal,
+      validationResult,
       generatedCode,
       samplePayload,
       testNormalized,
       ingestedAt: new Date().toISOString()
     };
 
-    this.history.push(result);
-    return result;
+    this.history.push(successResult);
+    return successResult;
   }
 
   extractProtocolMetadata(specText) {
     const text = specText.toLowerCase();
     
-    // Check if it's the x402 HTTP-native spec or custom
+    // Check if it's the x402 HTTP-native spec
     if (text.includes('x402') || text.includes('402 payment required') || text.includes('x-agent-payment')) {
       return {
         id: 'x402',
@@ -97,13 +152,14 @@ export class ProtocolIngestionAgent {
           x_protocol: 'x402-v1',
           headers: {
             x_agent_id: 'did:agent:x402:autonomous_buyer_402',
-            x_auth_proof: '0x8892fbc...'
+            x_auth_proof: '0x8892fbc9471182309aaee'
           },
           body: {
             purchase_orders: [
-              { item_id: 'SKU_PREMIUM_BASMATI_5KG', units: 2, price_per_unit: 540 }
+              { item_id: 'SKU_INDIA_GATE_CLASSIC_10KG', units: 2, price_per_unit: 540 },
+              { item_id: 'SKU_AMUL_COW_GHEE_1L', units: 1, price_per_unit: 620 }
             ],
-            settlement_amount: 1080,
+            settlement_amount: 1700,
             currency: 'INR',
             callback_url: 'https://agent.x402.network/settle'
           }
@@ -111,7 +167,7 @@ export class ProtocolIngestionAgent {
       };
     }
 
-    // Default dynamic inference for any other protocol
+    // Default dynamic inference for other protocols
     const idMatch = specText.match(/protocol[:\s]+(["']?)([\w-]+)\1/i) || specText.match(/name[:\s]+(["']?)([\w-]+)\1/i);
     const id = idMatch ? idMatch[2].toLowerCase().replace(/[^a-z0-9_-]/g, '') : `custom_${Date.now().toString().slice(-4)}`;
     const name = idMatch ? idMatch[2].toUpperCase() : 'Custom Ingested Protocol';
@@ -120,11 +176,15 @@ export class ProtocolIngestionAgent {
       id,
       name: `${name} (AI Ingested)`,
       version: '1.0',
+      agentField: 'agent.did || agent_id',
+      itemsField: 'items || line_items',
+      amountField: 'amount || gross_val',
+      currencyField: 'currency',
       samplePayload: {
         protocol: id,
         agent: { did: `did:agent:${id}:test_client` },
-        items: [{ sku: 'SKU_TEA_500G', qty: 1, unit_price: 250 }],
-        amount: 250,
+        items: [{ sku: 'SKU_AASHIRVAAD_ATTA_10KG', qty: 1, unit_price: 430 }],
+        amount: 430,
         currency: 'INR'
       }
     };
@@ -139,24 +199,22 @@ export class Dynamic_${meta.id.replace(/[^a-zA-Z0-9]/g, '_')}_Adapter extends Ba
   constructor() {
     super('${meta.id}', '${meta.name}', '${meta.version}');
     this.isDynamic = true;
+    this.status = 'PENDING_VALIDATION';
     this.ingestedAt = '${new Date().toISOString()}';
   }
 
   normalize(rawPayload, context = {}) {
     if (!rawPayload) throw new Error('Empty payload for ${meta.id}');
 
-    // Dynamically inferred field mappings
     const headers = rawPayload.headers || {};
     const body = rawPayload.body || rawPayload;
 
-    // Agent ID extraction
     const agent_id = headers.x_agent_id || 
                      body.payer_did || 
                      rawPayload.agent_id || 
                      rawPayload.agent?.did || 
                      'did:agent:${meta.id}:autonomous';
 
-    // Items array extraction
     const rawItems = body.purchase_orders || body.items || body.line_items || [];
     const items = rawItems.map((item, idx) => ({
       sku: item.item_id || item.sku || item.prod_code || \`ITEM_\${idx + 1}\`,
@@ -186,14 +244,12 @@ export class Dynamic_${meta.id.replace(/[^a-zA-Z0-9]/g, '_')}_Adapter extends Ba
 
   formatResponse(mandate, executionResult) {
     return {
-      x402_handshake: 'COMPLETED',
-      status: mandate.status === 'executed' ? '200_OK_PAID' : (mandate.status === 'approved' ? '202_ACCEPTED' : '403_POLICY_FORBIDDEN'),
+      protocol: '${meta.id}',
+      status: mandate.status === 'executed' ? 'SETTLED' : (mandate.status === 'approved' ? 'ACCEPTED' : 'REJECTED'),
       canonical_mandate_id: mandate.mandate_id,
-      settlement: {
-        razorpay_order_id: executionResult?.orderId || null,
-        amount_settled: mandate.total_amount,
-        currency: mandate.currency
-      },
+      razorpay_order_id: executionResult?.orderId || null,
+      settlement_amount: mandate.total_amount,
+      currency: mandate.currency,
       signature: mandate.signature
     };
   }
@@ -203,6 +259,7 @@ export class Dynamic_${meta.id.replace(/[^a-zA-Z0-9]/g, '_')}_Adapter extends Ba
   instantiateDynamicAdapter(meta, code) {
     const adapter = new BaseProtocolAdapter(meta.id, meta.name, meta.version);
     adapter.isDynamic = true;
+    adapter.status = 'PENDING_VALIDATION';
     adapter.ingestedAt = new Date().toISOString();
 
     adapter.normalize = function(rawPayload, context = {}) {

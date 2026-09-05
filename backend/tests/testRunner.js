@@ -3,6 +3,7 @@ import { AcpAdapter } from '../src/adapters/acpAdapter.js';
 import { Ap2Adapter } from '../src/adapters/ap2Adapter.js';
 import { adapterRegistry } from '../src/adapters/adapterRegistry.js';
 import { protocolIngestionAgent } from '../src/ingestion/protocolIngestionAgent.js';
+import { validateAdapterMapping } from '../src/ingestion/adapterValidator.js';
 import { policyEngine } from '../src/policy/policyEngine.js';
 import { killSwitch } from '../src/policy/killSwitch.js';
 import { razorpayClient } from '../src/execution/razorpayClient.js';
@@ -109,7 +110,7 @@ async function runTests() {
 
   // Test 4: Policy Engine
   console.log('\n[Test Suite 4] Policy Engine & Progressive Trust Tiers');
-  policyEngine.setAgentTrustTier('urn:agent:policy_test', 1); // Tier 1 ceiling = 1000
+  policyEngine.setAgentTrustTier('urn:agent:policy_test', 1);
   
   const okMandate = createCanonicalMandate({
     agent_id: 'urn:agent:policy_test',
@@ -178,14 +179,11 @@ async function runTests() {
     status: 'approved'
   });
 
-  // First insert: should succeed atomically
   const firstInsert = await testDb.insertMandateAtomic(originalMandate);
   assert(firstInsert.success === true && firstInsert.duplicate === false, 'First atomic INSERT succeeds');
 
-  // Duplicate insert with the exact same mandate_id: must trigger UNIQUE constraint violation
-  // and be caught cleanly as DUPLICATE_REJECTED rather than crashing the system
   const duplicateAttempt = createCanonicalMandate({
-    mandate_id: 'man_unique_test_1001', // Same ID!
+    mandate_id: 'man_unique_test_1001',
     agent_id: 'urn:agent:test:replay_attacker',
     origin_protocol: 'acp',
     total_amount: 1800,
@@ -199,12 +197,90 @@ async function runTests() {
   assert(duplicateResult.mandate.status === 'DUPLICATE_REJECTED', 'Status caught and set to DUPLICATE_REJECTED');
   assert(typeof duplicateResult.mandate.reason === 'string', 'Detailed rejection reason provided without crash');
 
-  // Verify DB state remains untampered
   const fetchedMandate = await testDb.getMandateById('man_unique_test_1001');
   assert(fetchedMandate.total_amount === 950, 'Original mandate in DB remains untampered (atomic isolation)');
 
   await testDb.close();
   if (fs.existsSync(testDbFile)) fs.unlinkSync(testDbFile);
+
+  // Test 8: Deterministic validateAdapterMapping & Protocol Lane State Transition
+  console.log('\n[Test Suite 8] Deterministic validateAdapterMapping & Protocol Lane State Transition');
+  
+  // (a) Valid proposal check
+  const validProposal = {
+    protocolId: 'x402_test',
+    name: 'x402 Protocol',
+    fieldMappings: {
+      agent_id: 'headers.x_agent_id',
+      items: 'body.purchase_orders',
+      total_amount: 'body.settlement_amount',
+      currency: 'body.currency'
+    },
+    sampleNormalized: {
+      agent_id: 'did:agent:x402:test_client',
+      origin_protocol: 'x402_test',
+      merchant_id: 'kirana_test_04',
+      items: [{ sku: 'SKU_ITEM_1', qty: 2, unit_price: 300 }],
+      total_amount: 600,
+      currency: 'INR'
+    }
+  };
+
+  const validRes = validateAdapterMapping(validProposal);
+  assert(validRes.isValid === true, 'Valid proposal returns isValid: true');
+  assert(validRes.passedFieldsCount === 4, 'Valid proposal passes all 4 required check groups');
+  assert(validRes.failedFields.length === 0, 'Valid proposal has 0 failed fields');
+
+  // (b) Non-numeric / missing amount check
+  const badAmountProposal = {
+    ...validProposal,
+    sampleNormalized: {
+      ...validProposal.sampleNormalized,
+      total_amount: 'NOT_A_NUMBER' // invalid numeric type
+    }
+  };
+  const badAmountRes = validateAdapterMapping(badAmountProposal);
+  assert(badAmountRes.isValid === false, 'Rejects non-numeric total_amount');
+  assert(badAmountRes.failedFields.includes('amount'), 'Failed fields lists "amount"');
+
+  // (c) Missing currency check
+  const missingCurrencyProposal = {
+    ...validProposal,
+    sampleNormalized: {
+      ...validProposal.sampleNormalized,
+      currency: null // missing currency
+    }
+  };
+  const badCurrencyRes = validateAdapterMapping(missingCurrencyProposal);
+  assert(badCurrencyRes.isValid === false, 'Rejects null/missing currency');
+  assert(badCurrencyRes.failedFields.includes('currency'), 'Failed fields lists "currency"');
+
+  // (d) Missing agent_id check
+  const missingAgentIdProposal = {
+    ...validProposal,
+    sampleNormalized: {
+      ...validProposal.sampleNormalized,
+      agent_id: '' // empty agent_id
+    }
+  };
+  const badAgentIdRes = validateAdapterMapping(missingAgentIdProposal);
+  assert(badAgentIdRes.isValid === false, 'Rejects empty agent_id');
+  assert(badAgentIdRes.failedFields.includes('agent_id'), 'Failed fields lists "agent_id"');
+
+  // (e) Unmapped canonical field check (e.g. missing items array)
+  const unmappedFieldProposal = {
+    ...validProposal,
+    sampleNormalized: {
+      agent_id: 'did:agent:test',
+      origin_protocol: 'test',
+      merchant_id: 'kirana_test_04',
+      total_amount: 500,
+      currency: 'INR'
+      // items missing!
+    }
+  };
+  const unmappedRes = validateAdapterMapping(unmappedFieldProposal);
+  assert(unmappedRes.isValid === false, 'Rejects proposal with unmapped canonical items field');
 
   console.log(`\n========================================`);
   console.log(`TEST SUMMARY: ${passed} PASSED, ${failed} FAILED`);
