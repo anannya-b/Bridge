@@ -6,6 +6,7 @@ import { protocolIngestionAgent } from '../src/ingestion/protocolIngestionAgent.
 import { policyEngine } from '../src/policy/policyEngine.js';
 import { killSwitch } from '../src/policy/killSwitch.js';
 import { razorpayClient } from '../src/execution/razorpayClient.js';
+import { MandateDatabase } from '../src/db/database.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -159,6 +160,51 @@ async function runTests() {
   assert(execResult.success === true, 'Executes payment for valid approved mandate');
   assert(execResult.orderId.startsWith('order_'), 'Returns valid Razorpay order ID');
   assert(execResult.paymentId.startsWith('pay_'), 'Returns valid Razorpay payment ID');
+
+  // Test 7: SQLite Unique Constraint & Atomic Transaction Catch Path
+  console.log('\n[Test Suite 7] SQLite Unique Constraint & Atomic Transaction Catch Path');
+  const testDbFile = path.resolve(__dirname, '../../data/test_bridge.db');
+  if (fs.existsSync(testDbFile)) fs.unlinkSync(testDbFile);
+
+  const testDb = new MandateDatabase(testDbFile);
+  await testDb.init();
+
+  const originalMandate = createCanonicalMandate({
+    mandate_id: 'man_unique_test_1001',
+    agent_id: 'urn:agent:test:unique_agent',
+    origin_protocol: 'acp',
+    total_amount: 950,
+    currency: 'INR',
+    status: 'approved'
+  });
+
+  // First insert: should succeed atomically
+  const firstInsert = await testDb.insertMandateAtomic(originalMandate);
+  assert(firstInsert.success === true && firstInsert.duplicate === false, 'First atomic INSERT succeeds');
+
+  // Duplicate insert with the exact same mandate_id: must trigger UNIQUE constraint violation
+  // and be caught cleanly as DUPLICATE_REJECTED rather than crashing the system
+  const duplicateAttempt = createCanonicalMandate({
+    mandate_id: 'man_unique_test_1001', // Same ID!
+    agent_id: 'urn:agent:test:replay_attacker',
+    origin_protocol: 'acp',
+    total_amount: 1800,
+    currency: 'INR',
+    status: 'pending'
+  });
+
+  const duplicateResult = await testDb.insertMandateAtomic(duplicateAttempt);
+  assert(duplicateResult.success === false, 'Duplicate insert is not committed');
+  assert(duplicateResult.duplicate === true, 'Uniqueness constraint violation detected');
+  assert(duplicateResult.mandate.status === 'DUPLICATE_REJECTED', 'Status caught and set to DUPLICATE_REJECTED');
+  assert(typeof duplicateResult.mandate.reason === 'string', 'Detailed rejection reason provided without crash');
+
+  // Verify DB state remains untampered
+  const fetchedMandate = await testDb.getMandateById('man_unique_test_1001');
+  assert(fetchedMandate.total_amount === 950, 'Original mandate in DB remains untampered (atomic isolation)');
+
+  await testDb.close();
+  if (fs.existsSync(testDbFile)) fs.unlinkSync(testDbFile);
 
   console.log(`\n========================================`);
   console.log(`TEST SUMMARY: ${passed} PASSED, ${failed} FAILED`);

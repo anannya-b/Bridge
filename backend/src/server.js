@@ -15,6 +15,7 @@ import { policyEngine, TIER_POLICIES } from './policy/policyEngine.js';
 import { killSwitch } from './policy/killSwitch.js';
 import { reasoningNarrator } from './narrator/reasoningNarrator.js';
 import { razorpayClient } from './execution/razorpayClient.js';
+import { mandateDb } from './db/database.js';
 
 dotenv.config();
 
@@ -28,9 +29,18 @@ app.use(express.json({ limit: '10mb' }));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// In-memory records
+// In-memory records cache
 const recentMandates = [];
 const recentNarrations = [];
+
+// Initialize SQLite database on startup
+mandateDb.init().then(async () => {
+  console.log('[Bridge Database] SQLite mandates table initialized with UNIQUE(mandate_id) constraint.');
+  const existing = await mandateDb.getRecentMandates(30);
+  existing.forEach(m => recentMandates.push(m));
+}).catch(err => {
+  console.error('[Bridge Database] Database init error:', err);
+});
 
 // Broadcast utility
 function broadcast(event, data) {
@@ -80,14 +90,16 @@ const INVENTORY_CATALOG = [
   { sku: 'SKU_PISTA_IRANIAN_5KG', name: 'Iranian Roasted Salted Pistachios 5kg', base_price: 5600 }
 ];
 
-function getRandomItem(excludeIndices = []) {
-  const available = INVENTORY_CATALOG.filter((_, idx) => !excludeIndices.includes(idx));
-  const chosen = available[Math.floor(Math.random() * available.length)];
-  return { ...chosen };
-}
-
 /**
- * Core Gateway Pipeline
+ * Core Gateway Pipeline:
+ * 1. Identify Adapter
+ * 2. Translate to Canonical Mandate
+ * 3. Atomic Database Insertion with UNIQUE(mandate_id) constraint & DUPLICATE_REJECTED catch
+ * 4. Kill Switch / Circuit Breaker Check
+ * 5. Policy Engine Evaluation
+ * 6. Execution via Razorpay (if approved)
+ * 7. Update Mandate Record in DB
+ * 8. Reasoning Narrator & Broadcast
  */
 async function processGatewayTransaction(protocolId, rawPayload, options = {}) {
   const adapter = adapterRegistry.getAdapter(protocolId);
@@ -107,14 +119,64 @@ async function processGatewayTransaction(protocolId, rawPayload, options = {}) {
   
   let mandate = createCanonicalMandate({
     ...normalized,
+    mandate_id: rawPayload.mandate_id || options.mandate_id || undefined,
     agent_trust_tier: agentStateBefore.trust_tier,
     spend_cap_checked_against: TIER_POLICIES[agentStateBefore.trust_tier]?.max_auto_approve_amount || 1000,
     status: 'pending'
   });
 
+  // 2. ATOMIC DATABASE INSERTION WITH UNIQUE CONSTRAINT
+  // Attempts single atomic transaction INSERT. Catches uniqueness violation as 'DUPLICATE_REJECTED' rather than crash.
+  const insertResult = await mandateDb.insertMandateAtomic(mandate);
+
+  if (insertResult.duplicate) {
+    mandate = insertResult.mandate; // Status: 'DUPLICATE_REJECTED'
+    
+    const duplicateEvaluation = {
+      mandate_id: mandate.mandate_id,
+      agent_id: mandate.agent_id,
+      decision: 'rejected',
+      breachReason: mandate.reason || 'Uniqueness violation: duplicate mandate_id rejected',
+      checks: [
+        { rule: 'ATOMIC_UNIQUE_MANDATE_CONSTRAINT', passed: false, details: 'Mandate ID already exists in SQLite table' }
+      ]
+    };
+
+    broadcast('MANDATE_CREATED', { mandate });
+    broadcast('MANDATE_UPDATED', { mandate, evaluation: duplicateEvaluation });
+
+    const narrative = await reasoningNarrator.explainDecision({
+      mandate,
+      evaluation: duplicateEvaluation,
+      killCheck: { tripped: false },
+      originProtocolName: adapter.name,
+      agentState: agentStateBefore
+    });
+
+    const narrationRecord = {
+      mandate_id: mandate.mandate_id,
+      agent_id: mandate.agent_id,
+      decision: mandate.status,
+      text: narrative,
+      timestamp: new Date().toISOString()
+    };
+
+    recentNarrations.unshift(narrationRecord);
+    recentMandates.unshift(mandate);
+    broadcast('NARRATION_READY', narrationRecord);
+
+    return {
+      mandate,
+      evaluation: duplicateEvaluation,
+      executionResult: null,
+      narrative,
+      protocolResponse: adapter.formatResponse(mandate, null)
+    };
+  }
+
   broadcast('MANDATE_CREATED', { mandate });
 
-  // 2. Kill Switch / Circuit Breaker Check
+  // 3. Kill Switch / Circuit Breaker Check
   const killCheck = killSwitch.check(mandate);
   let evaluation;
   let executionResult = null;
@@ -134,13 +196,13 @@ async function processGatewayTransaction(protocolId, rawPayload, options = {}) {
       checks: [{ rule: 'CIRCUIT_BREAKER_KILL_SWITCH', passed: false, details: killCheck.reason }]
     };
   } else {
-    // 3. Policy Engine Evaluation
+    // 4. Policy Engine Evaluation
     evaluation = policyEngine.evaluateMandate(mandate);
     
     if (evaluation.decision === 'approved') {
       mandate = updateMandateStatus(mandate, 'approved');
       
-      // 4. Execution via Razorpay
+      // 5. Execution via Razorpay
       try {
         executionResult = await razorpayClient.executeMandatePayment(mandate);
         mandate = updateMandateStatus(mandate, 'executed', { razorpay_order_id: executionResult.orderId });
@@ -162,7 +224,10 @@ async function processGatewayTransaction(protocolId, rawPayload, options = {}) {
     }
   }
 
-  // Deduplicate and update mandate history
+  // Persist updated mandate state to DB
+  await mandateDb.updateMandate(mandate);
+
+  // Deduplicate and update in-memory cache
   const existingIdx = recentMandates.findIndex(m => m.mandate_id === mandate.mandate_id);
   if (existingIdx >= 0) {
     recentMandates[existingIdx] = mandate;
@@ -173,7 +238,7 @@ async function processGatewayTransaction(protocolId, rawPayload, options = {}) {
 
   broadcast('MANDATE_UPDATED', { mandate, evaluation });
 
-  // 5. Reasoning Narrator
+  // 6. Reasoning Narrator
   const agentStateAfter = policyEngine.getAgentState(mandate.agent_id);
   const narrative = await reasoningNarrator.explainDecision({
     mandate,
@@ -230,9 +295,10 @@ app.get('/api/adapters', (req, res) => {
   res.json(adapterRegistry.listAdapters());
 });
 
-app.get('/api/audit', (req, res) => {
+app.get('/api/audit', async (req, res) => {
+  const dbMandates = await mandateDb.getRecentMandates(50);
   res.json({
-    mandates: recentMandates,
+    mandates: dbMandates.length > 0 ? dbMandates : recentMandates,
     narrations: recentNarrations,
     policyLogs: policyEngine.getAuditLog(50),
     killEvents: killSwitch.getKillEvents(20)
@@ -241,11 +307,11 @@ app.get('/api/audit', (req, res) => {
 
 app.post('/api/process', async (req, res) => {
   try {
-    const { protocolId, payload } = req.body;
+    const { protocolId, payload, mandate_id } = req.body;
     if (!protocolId || !payload) {
       return res.status(400).json({ error: 'Missing protocolId or payload' });
     }
-    const result = await processGatewayTransaction(protocolId, payload);
+    const result = await processGatewayTransaction(protocolId, payload, { mandate_id });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -276,10 +342,9 @@ app.post('/api/ingest', async (req, res) => {
   }
 });
 
-// Counter to drive realistic variance and progressive trust
 let scenarioRunCounter = 0;
+let lastProcessedMandateId = null;
 
-// Persistent Returning Buyer Agent for progressive trust demonstration
 const RETURNING_ACP_AGENT = 'urn:agent:google:acp:procure_bot_main';
 const RETURNING_AP2_AGENT = 'did:npci:uap:in:retail_restock_lead';
 
@@ -290,23 +355,21 @@ app.post('/api/scenario/:name', async (req, res) => {
 
   try {
     if (name === 'acp_normal') {
-      // Progressive trust: uses persistent returning agent so its trust tier visibly elevates over runs!
       const currentAgentState = policyEngine.getAgentState(RETURNING_ACP_AGENT);
       const currentTier = currentAgentState.trust_tier;
       const cap = TIER_POLICIES[currentTier]?.max_auto_approve_amount || 1000;
 
-      // Select dynamic items fitting inside the current tier ceiling
       const qty1 = (runId % 2) + 1;
       const qty2 = 1;
-      const item1 = INVENTORY_CATALOG[1]; // Atta
-      const item2 = INVENTORY_CATALOG[3 + (runId % 3)]; // Varied spice/ghee
+      const item1 = INVENTORY_CATALOG[1];
+      const item2 = INVENTORY_CATALOG[3 + (runId % 3)];
 
       const cart = [
         { item_sku: item1.sku, quantity: qty1, price_inr: item1.base_price + (runId * 5 % 30) },
         { item_sku: item2.sku, quantity: qty2, price_inr: item2.base_price }
       ];
       let total = cart.reduce((sum, i) => sum + (i.price_inr * i.quantity), 0);
-      if (total > cap) total = cap - 60; // ensure fits within progressive ceiling
+      if (total > cap) total = cap - 60;
 
       const payload = {
         acp_version: '2026.1',
@@ -323,16 +386,14 @@ app.post('/api/scenario/:name', async (req, res) => {
       };
 
       const result = await processGatewayTransaction('acp', payload);
+      lastProcessedMandateId = result.mandate.mandate_id;
       return res.json({ scenario: name, result });
     }
 
     if (name === 'ap2_normal') {
       const currentAgentState = policyEngine.getAgentState(RETURNING_AP2_AGENT);
-      const currentTier = currentAgentState.trust_tier;
-
-      // Realistic AP2 Restock Lines with dynamic variance
-      const itemA = INVENTORY_CATALOG[7]; // Mustard oil
-      const itemB = INVENTORY_CATALOG[8 + (runId % 3)]; // Varied dal/tea
+      const itemA = INVENTORY_CATALOG[7];
+      const itemB = INVENTORY_CATALOG[8 + (runId % 3)];
       const countA = (runId % 2) + 1;
       const countB = 1;
       const rateA = itemA.base_price + (runId * 10 % 50);
@@ -357,6 +418,7 @@ app.post('/api/scenario/:name', async (req, res) => {
       };
 
       const result = await processGatewayTransaction('ap2', payload);
+      lastProcessedMandateId = result.mandate.mandate_id;
       return res.json({ scenario: name, result });
     }
 
@@ -406,6 +468,7 @@ app.post('/api/scenario/:name', async (req, res) => {
 
       policyEngine.setAgentTrustTier(x402AgentId, 2);
       const txResult = await processGatewayTransaction('x402', payload);
+      lastProcessedMandateId = txResult.mandate.mandate_id;
 
       return res.json({
         scenario: name,
@@ -439,6 +502,7 @@ app.post('/api/scenario/:name', async (req, res) => {
 
       policyEngine.setAgentTrustTier(unverifiedAgentId, 1);
       const result = await processGatewayTransaction('acp', payload);
+      lastProcessedMandateId = result.mandate.mandate_id;
       return res.json({ scenario: name, result });
     }
 
@@ -446,12 +510,11 @@ app.post('/api/scenario/:name', async (req, res) => {
       const rogueAgentId = `urn:agent:rogue_highfreq_bot_${runId + 20}`;
       policyEngine.unfreezeAgent(rogueAgentId);
       
-      // Dynamic realistic high-value inventory items for burst sequence
       const burstCatalog = [
-        INVENTORY_CATALOG[11], // Cashew 5kg
-        INVENTORY_CATALOG[12], // Almonds 10kg
-        INVENTORY_CATALOG[13], // Saffron 50g
-        INVENTORY_CATALOG[14]  // Pista 5kg
+        INVENTORY_CATALOG[11],
+        INVENTORY_CATALOG[12],
+        INVENTORY_CATALOG[13],
+        INVENTORY_CATALOG[14]
       ];
 
       const results = [];
@@ -469,9 +532,42 @@ app.post('/api/scenario/:name', async (req, res) => {
         };
         const resTx = await processGatewayTransaction('acp', payload);
         results.push(resTx);
-        await new Promise(r => setTimeout(r, 120)); // Rapid burst within 500ms
+        await new Promise(r => setTimeout(r, 120));
       }
       return res.json({ scenario: name, results });
+    }
+
+    // Scenario: Test atomic unique constraint rejection on duplicate mandate_id
+    if (name === 'duplicate_replay') {
+      const targetId = lastProcessedMandateId || `man_sample_duplicate_${Date.now()}`;
+      
+      // Ensure targetId is inserted first if not already present
+      if (!lastProcessedMandateId) {
+        const primePayload = {
+          acp_version: '2026.1',
+          buyer_agent: { agent_urn: 'urn:agent:test:replay_primer' },
+          order_intent: {
+            cart: [{ item_sku: 'SKU_MDH_DEGGI_MIRCH_1KG', quantity: 1, price_inr: 490 }],
+            currency: 'INR',
+            declared_total: 490
+          }
+        };
+        const primeResult = await processGatewayTransaction('acp', primePayload, { mandate_id: targetId });
+      }
+
+      // Now attempt duplicate replay with the exact same mandate_id
+      const replayPayload = {
+        acp_version: '2026.1',
+        buyer_agent: { agent_urn: 'urn:agent:test:replay_attacker' },
+        order_intent: {
+          cart: [{ item_sku: 'SKU_FORTUNE_SUNFLOWER_15L', quantity: 1, price_inr: 1850 }],
+          currency: 'INR',
+          declared_total: 1850
+        }
+      };
+
+      const replayResult = await processGatewayTransaction('acp', replayPayload, { mandate_id: targetId });
+      return res.json({ scenario: name, targetId, result: replayResult });
     }
 
     if (name === 'reset_state') {
@@ -482,7 +578,8 @@ app.post('/api/scenario/:name', async (req, res) => {
       killSwitch.agentHistory.clear();
       policyEngine.agentStates.clear();
       
-      // Reset returning agents
+      await mandateDb.clear();
+
       policyEngine.setAgentTrustTier(RETURNING_ACP_AGENT, 1);
       policyEngine.setAgentTrustTier(RETURNING_AP2_AGENT, 1);
 

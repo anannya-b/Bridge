@@ -13,6 +13,11 @@ export class ReasoningNarrator {
    * @returns {Promise<string>}
    */
   async explainDecision({ mandate, evaluation, killCheck, originProtocolName, agentState }) {
+    // If duplicate mandate rejected by atomic DB constraint
+    if (mandate.status === 'DUPLICATE_REJECTED') {
+      return `Rejected (Duplicate) — Mandate ID "${mandate.mandate_id}" has already been recorded in database. Atomic transaction rejected insert to prevent replay or double-charge attack.`;
+    }
+
     // If kill switch triggered
     if (killCheck?.tripped) {
       if (killCheck.type === 'BURST_ATTACK') {

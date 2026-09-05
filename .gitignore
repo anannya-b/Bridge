@@ -3,6 +3,12 @@ node_modules/
 /.pnp
 .pnp.js
 
+# Database
+data/*.db
+data/*.sqlite*
+*.db
+*.sqlite*
+
 # Testing
 /coverage
 
