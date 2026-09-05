@@ -124,9 +124,9 @@ The interface is built to look like a live systems console rather than a typical
 
 ## Running it locally
 
-```
-git clone <repo-url>
-cd bridge
+```bash
+git clone https://github.com/anannya-b/Bridge.git
+cd Bridge
 
 cd backend
 npm install
